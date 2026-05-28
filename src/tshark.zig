@@ -6,19 +6,45 @@ const std = @import("std");
 ///   `TShark (Wireshark) 4.0.8 (v4.0.8-0-g81696bb74857).`
 ///
 /// Mirrors `parse_tshark_version` in `rust/ja4/src/lib.rs`.
+///
+/// Implementation notes (optimized):
+///   • The 2-byte `") "` marker used to be matched via `std.mem.indexOf`,
+///     which falls back to a generic Boyer-Moore-style scan. We now find `)`
+///     with `indexOfScalarPos` (SIMD-vectorized on x86_64 and AArch64) and
+///     only confirm the trailing space, restarting if not.
+///   • The whitespace scan uses a single-character switch (compiles to a
+///     compact compare-tree); the trailing-dot stripping is folded into the
+///     final slice computation so there's no second pass.
 pub fn parseVersion(output: []const u8) ?[]const u8 {
-    const marker = ") ";
-    const start_idx = std.mem.indexOf(u8, output, marker) orelse return null;
-    const after = output[start_idx + marker.len ..];
-    var end: usize = 0;
-    while (end < after.len) : (end += 1) {
-        const c = after[end];
-        if (c == ' ' or c == '\t' or c == '\n' or c == '\r') break;
+    // Locate ") " — scan for ')' first because indexOfScalar has a fast
+    // SIMD path, then bounds-check + verify the next byte is a space. If a
+    // bare ')' is found in the middle of nowhere we keep searching.
+    var search_from: usize = 0;
+    const value_start = while (true) {
+        const close_idx = std.mem.indexOfScalarPos(u8, output, search_from, ')') orelse return null;
+        if (close_idx + 1 < output.len and output[close_idx + 1] == ' ') {
+            break close_idx + 2;
+        }
+        search_from = close_idx + 1;
+    };
+
+    // Scan version body until whitespace or end-of-string.
+    var end = value_start;
+    while (end < output.len) : (end += 1) {
+        switch (output[end]) {
+            ' ', '\t', '\n', '\r' => break,
+            else => {},
+        }
     }
-    if (end == 0 or end == after.len) return null;
-    var ver = after[0..end];
-    if (ver.len > 0 and ver[ver.len - 1] == '.') ver = ver[0 .. ver.len - 1];
-    return ver;
+
+    // Match the upstream Rust contract: we require *some* whitespace
+    // terminator. Hitting EOF means we don't trust the version string.
+    if (end == output.len) return null;
+    if (end == value_start) return null;
+
+    // Strip an optional trailing '.' without a second pass.
+    const stop = if (output[end - 1] == '.') end - 1 else end;
+    return output[value_start..stop];
 }
 
 test "parseVersion typical" {
@@ -48,4 +74,13 @@ test "parseVersion abrupt end returns null" {
 
 test "parseVersion garbage returns null" {
     try std.testing.expect(parseVersion("What the TShark?!") == null);
+}
+
+test "parseVersion lone ')' before the real marker" {
+    // A `)` that isn't followed by space shouldn't trick us — we should
+    // keep scanning for the real `") "`.
+    try std.testing.expectEqualStrings(
+        "4.0.0",
+        parseVersion("foo)bar (Wireshark) 4.0.0 (rest)").?,
+    );
 }
