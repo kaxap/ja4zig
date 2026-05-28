@@ -1,7 +1,7 @@
 # ja4zig
 
 Zig port of the FoxIO JA4+ network fingerprinting suite.
-Mirrors the Rust crate at [`../ja4/rust/ja4`](../ja4/rust/ja4).
+Mirrors the Rust crate at [`https://github.com/FoxIO-LLC/ja4`](https://github.com/FoxIO-LLC/ja4).
 Targets Zig 0.16.0.
 
 > **Status:** phase 1 — test harness only. The CLI is a stub; the snapshot

@@ -45,7 +45,8 @@ pub fn writePcapTable(w: *Io.Writer, results: []const pcap_bench.PcapResult) !vo
 
     for (results) |r| {
         try w.print("{s:<46} ", .{truncate(r.pcap_name, 46)});
-        try w.print("{s:>8} ", .{prettyBytes(r.pcap_bytes)});
+        try writePrettyBytes(w, r.pcap_bytes, 8);
+        try w.print(" ", .{});
         try w.print("{s:<7} ", .{r.impl.label()});
         if (r.summary) |s| {
             try stats.formatDuration(w, @floatFromInt(s.min_ns));
@@ -117,13 +118,22 @@ fn truncate(s: []const u8, max: usize) []const u8 {
     return if (s.len <= max) s else s[0..max];
 }
 
-var pretty_buf: [16]u8 = undefined;
-
-fn prettyBytes(n: u64) []const u8 {
-    const fbuf = std.fmt.bufPrint(&pretty_buf, "{d}", .{n}) catch return "?";
-    if (n < 1024) return fbuf;
-    if (n < 1024 * 1024) {
-        return std.fmt.bufPrint(&pretty_buf, "{d:.1}K", .{@as(f64, @floatFromInt(n)) / 1024.0}) catch "?";
+/// Formats `n` as a short human-readable byte count into a writer instead of
+/// returning a slice over a static buffer (the previous implementation was
+/// not reentrant — calling it twice in a single `print` call clobbered the
+/// earlier result).
+fn writePrettyBytes(w: *std.Io.Writer, n: u64, comptime width: comptime_int) !void {
+    if (n < 1024) {
+        try w.print("{d:>" ++ std.fmt.comptimePrint("{d}", .{width}) ++ "}", .{n});
+    } else if (n < 1024 * 1024) {
+        try w.print(
+            "{d:>" ++ std.fmt.comptimePrint("{d}", .{width - 1}) ++ ".1}K",
+            .{@as(f64, @floatFromInt(n)) / 1024.0},
+        );
+    } else {
+        try w.print(
+            "{d:>" ++ std.fmt.comptimePrint("{d}", .{width - 1}) ++ ".1}M",
+            .{@as(f64, @floatFromInt(n)) / (1024.0 * 1024.0)},
+        );
     }
-    return std.fmt.bufPrint(&pretty_buf, "{d:.1}M", .{@as(f64, @floatFromInt(n)) / (1024.0 * 1024.0)}) catch "?";
 }

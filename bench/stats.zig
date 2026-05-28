@@ -20,7 +20,24 @@ pub const Summary = struct {
 
     pub fn compute(samples: []i64) Summary {
         std.debug.assert(samples.len > 0);
-        std.mem.sort(i64, samples, {}, std.sort.asc(i64));
+        // Insertion sort wins decisively for the small `samples.len`
+        // (typically ≤30 — our bench batch count) we always see here:
+        // no quicksort recursion, no pivot selection, no temporary state.
+        // It's also branch-predictable on near-sorted data, which is the
+        // common steady-state pattern for bench samples.
+        if (samples.len <= 32) {
+            var i: usize = 1;
+            while (i < samples.len) : (i += 1) {
+                const x = samples[i];
+                var j: usize = i;
+                while (j > 0 and samples[j - 1] > x) : (j -= 1) {
+                    samples[j] = samples[j - 1];
+                }
+                samples[j] = x;
+            }
+        } else {
+            std.mem.sort(i64, samples, {}, std.sort.asc(i64));
+        }
 
         var sum: i128 = 0;
         for (samples) |s| sum += s;
@@ -58,8 +75,15 @@ pub const Summary = struct {
 };
 
 /// Formats a nanosecond count with adaptive units (ns/µs/ms/s).
+///
+/// When the value rounds to zero we display it as `<1ns` — under heavy
+/// `ReleaseFast` inlining a microbench body can amortize below the host
+/// clock's nanosecond resolution, and a literal `0.0ns` line would be a
+/// lie about what actually happened.
 pub fn formatDuration(w: *std.Io.Writer, ns: f64) std.Io.Writer.Error!void {
-    if (ns < 1_000.0) {
+    if (ns < 1.0) {
+        try w.print("{s:>9}", .{"<1ns"});
+    } else if (ns < 1_000.0) {
         try w.print("{d:>7.1}ns", .{ns});
     } else if (ns < 1_000_000.0) {
         try w.print("{d:>7.2}µs", .{ns / 1_000.0});
