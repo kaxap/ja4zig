@@ -28,38 +28,15 @@ pub fn hash12(s: []const u8, out: *[12]u8) void {
         return;
     }
 
-    // ── Build a content key in O(1) regardless of |s|. ────────────────────
-    var head: u64 = undefined;
-    var tail: u64 = undefined;
-    if (s.len >= 8) {
-        head = std.mem.readInt(u64, s[0..8], .little);
-        tail = std.mem.readInt(u64, s[s.len - 8 ..][0..8], .little);
-    } else {
-        // Pack the entire (short) content into one u64 so the cache key
-        // is still uniquely tied to the bytes, not a windowed sample.
-        var buf: [8]u8 = @splat(0);
-        @memcpy(buf[0..s.len], s);
-        head = std.mem.readInt(u64, &buf, .little);
-        tail = head;
-    }
-    const len32: u32 = @intCast(s.len);
-    const slot_idx: usize = @as(usize, @truncate(head ^ tail ^ @as(u64, len32))) & (cache_size - 1);
-
-    const slot = &cache[slot_idx];
-    if (slot.len == len32 and slot.head == head and slot.tail == tail) {
-        out.* = slot.digest;
-        return;
-    }
-
-    // ── Cold path: actually compute SHA-256. ──────────────────────────────
+    // The previous version cached digests under a (len, head8, tail8) key.
+    // That key is unique enough for random-ish inputs but flunks on JA4
+    // extension lists that share the same length plus a common prefix and
+    // suffix (different middle bytes). We saw this collide on tls3.pcapng
+    // streams whose ext lists differ only in the middle. Direct SHA-256
+    // every time — at ~3 GB/s steady state, JA4 callers can't notice.
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(s, &digest, .{});
     encodeHex6(digest[0..6].*, out);
-
-    slot.head = head;
-    slot.tail = tail;
-    slot.len = len32;
-    slot.digest = out.*;
 }
 
 /// Branchless SIMD hex encoder: 6 bytes → 12 ASCII hex chars.
