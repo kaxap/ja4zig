@@ -1,42 +1,94 @@
 # ja4zig
 
-Zig port of the FoxIO JA4+ network fingerprinting suite.
-Mirrors the Rust crate at [`https://github.com/FoxIO-LLC/ja4`](https://github.com/FoxIO-LLC/ja4).
+Zig port of the FoxIO JA4+ network fingerprinting suite — passive client/server
+fingerprints for TLS, HTTP, SSH, X.509, latency, and TCP, computed from a pcap
+file via tshark. Mirrors the Rust crate at
+[`https://github.com/FoxIO-LLC/ja4`](https://github.com/FoxIO-LLC/ja4).
 Targets Zig 0.16.0.
 
 | Surface | State |
 |---|---|
-| Library helpers (`hash`, `tshark`) | usable — see [Public API](#public-api) |
-| `ja4` CLI binary | stub — exits with `ja4zig: not implemented yet` |
-| Snapshot suite | 37 fixtures, all currently failing against the stub (by design) |
-| Unit tests | 14 passing (hash + cache + tshark version + stats) |
+| `ja4` CLI binary | functional — reads a pcap, emits YAML (per-stream JA4+ records) |
+| Library API (`hash`, `tshark`, `pcap`, `stream`, …) | usable as a Zig dependency |
+| Snapshot suite | 37 fixtures, **23 byte-exact green**; 14 differ only on EOF newlines (content-equivalent — see [Snapshot caveat](#snapshot-caveat)) |
+| Unit tests | 21/22 passing — the one failure is the snapshot harness reporting the 14 EOF-newline fixtures |
 
-The full per-protocol fingerprint pipeline (JA4 / JA4S / JA4H / JA4L / JA4X / JA4SSH) is in progress — see [Roadmap](#roadmap).
+The fingerprint pipeline (JA4 / JA4S / JA4H / JA4L / JA4X / JA4SSH) is
+implemented. Tshark ≥4.0.6 is required at runtime.
 
 ## What works today
 
-- **`hash.hash12(s, &out)`** — SHA-256 truncation, hex-encoded first 6 bytes. The primitive that every JA4 family hash ends in. Thread-local memoization makes the workload-typical "same fingerprint string repeated many times" case essentially free.
-- **`tshark.parseVersion(line)`** — pulls a SemVer string out of `tshark --version`'s first line; used to gate JA4+ against the >=4.0.6 floor that upstream requires.
-- **Vendored fixture corpus** — 38 pcaps + 37 reference YAML snapshots from upstream Rust `insta`, plus an opinionated benchmark suite. Even if you never call the Zig library, the harness is a usable template for any tshark-driven project.
+- **CLI** — `ja4 <pcap>` shells out to tshark, processes every packet, emits a
+  YAML record per stream matching the upstream Rust impl's
+  `assert_yaml_snapshot!` output. Flags: `-r/--with-raw` (include unhashed
+  fingerprints), `-O/--original-order` (disable cipher/extension/cookie
+  sorting), `-n/--with-packet-numbers` (`pkt_*` fields).
+- **Full JA4+ family**:
+  - **JA4** (TLS client) — TLS version, SNI presence, cipher count, extension
+    count, ALPN, GREASE filtering, hashed and sorted (or original-order) ciphers
+    + extensions + signature algorithms.
+  - **JA4S** (TLS server) — TLS version, selected cipher, extension list (never
+    sorted), ALPN.
+  - **JA4H** (HTTP client) — method, version, cookie/referer markers, header
+    count + names, primary `Accept-Language`, cookie names + values. HTTP/1 and
+    HTTP/2 paths.
+  - **JA4L** (latency) — light-distance times derived from the TCP three-way
+    handshake or QUIC Initial/Handshake exchanges; reports `µs_TTL` per side.
+  - **JA4SSH** — packet-length mode sampling every N SSH packets, plus
+    `ssh_extras` (hassh, hassh_server, protocol strings, negotiated encryption
+    algorithm).
+  - **JA4T** (TCP) — initial SYN window size, option kind sequence, MSS, window
+    scale.
+  - **JA4X** (X.509) — issuer/subject RDN OIDs + extension OIDs hashed, plus a
+    pretty `issuerCommonName: …` / `subjectOrganizationName: …` enrichment.
+    Built on a tiny custom ASN.1/DER walker (no dependencies).
+- **Helpers** — `hash.hash12` (SHA-256 truncated to 12 hex chars),
+  `tshark.parseVersion` (version-gate helper).
+- **Vendored corpus** — 38 pcaps + 37 reference YAML snapshots from upstream
+  Rust `insta`, plus a bench suite as a template.
 
 ## What's still WIP
 
-- Per-protocol fingerprint modules — TLS (JA4/JA4S), HTTP (JA4H), SSH (JA4SSH), latency (JA4L), X.509 (JA4X).
-- The `ja4` CLI binary exits non-zero with `ja4zig: not implemented yet` so the snapshot harness has something to invoke. See [Roadmap](#roadmap) for the order modules will land.
+- `~/.config/ja4/config.toml` loader (the Rust impl writes a default file on
+  first run and lets you toggle individual fingerprints off). Defaults match
+  upstream so this only matters if you'd want to disable a fingerprint type.
+- `-j/--json` output mode and `-o/--output <path>` (write to file).
+- `--keylog-file <path>` (TLS pre-master secrets for decrypting captures).
+- The "JA4Plus mapping" lookup CSV (not part of fingerprint generation).
+
+## Snapshot caveat
+
+23/37 snapshots match byte-for-byte. The 14 remaining differ from the upstream
+YAML reference by **one byte at EOF**: some upstream snapshots end with `\n`
+and some with `\n\n`, depending on the serde-yaml version that was running when
+each one was generated by `cargo insta review`. There's no content-derivable
+rule (same field types and shapes end different ways), and we emit a single
+`\n` because that matches the majority of fixtures.
+
+Verify content equivalence yourself:
+
+```sh
+diff -q \
+  <(./zig-out/bin/ja4 tests/testdata/pcap/tls12.pcap | sed -e 's/[[:space:]]*$//' | awk 'NF') \
+  <(sed -e 's/[[:space:]]*$//' tests/testdata/snapshots/tls12.pcap.yaml | awk 'NF')
+```
+
+…returns "match" for every fixture in the corpus.
 
 ## Using ja4zig as a dependency
 
-Until ja4zig ships a tagged release, depend on it by relative path. From your project's `build.zig.zon`:
+Until ja4zig ships a tagged release, depend on it by relative path. From your
+project's `build.zig.zon`:
 
 ```zig
 .dependencies = .{
     .ja4zig = .{
-        .path = "../ja4zig", // adjust to wherever you checked it out
+        .path = "../ja4zig",
     },
 },
 ```
 
-Then in your `build.zig`:
+In your `build.zig`:
 
 ```zig
 const ja4zig = b.dependency("ja4zig", .{
@@ -45,7 +97,7 @@ const ja4zig = b.dependency("ja4zig", .{
 exe.root_module.addImport("ja4zig", ja4zig.module("ja4zig"));
 ```
 
-And call from your code:
+Quick `hash12` usage:
 
 ```zig
 const ja4zig = @import("ja4zig");
@@ -57,83 +109,159 @@ pub fn main() void {
 }
 ```
 
-Once a remote release is published, the relative path swaps for a `zig fetch --save <url>` invocation.
+End-to-end (process a pcap through the same pipeline the CLI uses):
+
+```zig
+const ja4zig = @import("ja4zig");
+
+pub fn main(init: std.process.Init) !void {
+    var reader = try ja4zig.pcap.Reader.open(init.arena.allocator(), init.io, "trace.pcap", null);
+    defer reader.close();
+
+    var streams = ja4zig.stream.Streams.init(init.arena.allocator(), .{});
+    defer streams.deinit();
+
+    while (try reader.next()) |pkt| try streams.update(pkt);
+    try streams.finish();
+
+    var buf: [16 * 1024]u8 = undefined;
+    var fw: std.Io.File.Writer = .init(.stdout(), init.io, &buf);
+    try streams.emitYaml(&fw.interface, .{});
+    try fw.interface.flush();
+}
+```
 
 ## Public API
 
-### `hash.hash12(s: []const u8, out: *[12]u8) void`
+### Library helpers
 
-Writes the first 12 hex characters of `SHA-256(s)` into `out`. Returns `"000000000000"` (twelve ASCII zeros) when `s.len == 0`. No allocations.
+- **`hash.hash12(s: []const u8, out: *[12]u8) void`** — first 12 hex chars of
+  `SHA-256(s)`; empty input → `"000000000000"`. No allocations.
+- **`tshark.parseVersion(output: []const u8) ?[]const u8`** — extracts the
+  version string from `tshark --version`'s first line. Returns `null` if the
+  marker isn't found or no whitespace terminator follows.
 
-- **Thread safety**: the memoization cache is `threadlocal`. Each thread starts with a cold cache; calls on one thread never interfere with another's results.
-- **Soundness**: a cache hit verifies a 160-bit content fingerprint before returning. Cache miss always falls through to the SHA-256 compress.
+### Pcap iterator
 
-### `hash.resetCache() void`
+- **`pcap.Reader.open(gpa, io, pcap_path, ?keylog_path) !Reader`** — spawns
+  tshark with `-T ek`, captures the JSON output, and yields one packet per
+  `next()` call. Per-packet memory is held in an arena that resets between
+  calls — copy out what you want to keep.
+- **`Packet.findProto(name) ?Proto`** / **`lastProto(name) ?Proto`** —
+  innermost first/last layer with the given name; transparently descends into
+  `quic.tls` for QUIC-encapsulated TLS handshakes.
+- **`Proto.first(field) ?[]const u8`** / **`values(field) ValueIter`** —
+  field accessors using the rtshark naming convention
+  (`tls.handshake.extension.type`), translated on the fly to the tshark `-T ek`
+  double-prefixed form (`tls_tls_handshake_extension_type`).
 
-Clears the threadlocal cache. Intended for test isolation when you want guaranteed cold-cache behavior; not for the hot path.
+### Stream tracker
 
-### `tshark.parseVersion(output: []const u8) ?[]const u8`
-
-Parses the first line of `tshark --version`'s output (e.g. `"TShark (Wireshark) 4.0.8 (v4.0.8-0-g81696bb74857)."`) and returns a slice **into the input** pointing at the version digits (`"4.0.8"`). Returns `null` if:
-
-- No `") "` marker is present.
-- The marker is found but no whitespace terminator follows (we don't trust a version string that runs off the end of the buffer).
-
-Handles a bare `)` that isn't followed by space (e.g. inside a name) by continuing to scan; strips a single trailing `.` if present.
+- **`stream.Streams.init(gpa, .{ .tcp = true, .tls = true, … })`** — central
+  state. Per-fingerprint `Conf` toggles default on.
+- **`Streams.update(pkt) !void`** — dispatches packet to every enabled
+  fingerprint module. Per-module errors are swallowed (logged).
+- **`Streams.finish() !void`** — flushes in-flight JA4SSH samples at EOF.
+- **`Streams.emitYaml(writer, flags) !void`** — emits the same YAML record set
+  the CLI prints. `flags.with_raw`, `flags.original_order`,
+  `flags.with_packet_numbers` map directly to the CLI flags.
 
 ## Design notes
 
-### Content-keyed cache (`src/hash.zig`)
+### tshark driver (`src/pcap.zig`)
 
-`hash12` is fronted by a 16-slot direct-mapped cache living in thread-local storage. The cache entry layout is `extern struct { head: u64, tail: u64, len: u32, _pad: u32, digest: [12]u8 }` so each slot fits cleanly in a single cache line.
+We spawn `tshark -r <pcap> -T ek` (line-delimited JSON), capture stdout in one
+buffer via `std.process.run`, and iterate line-pairs (`{"index":…}` is skipped;
+the following data line is parsed with `std.json.parseFromSliceLeaky` into an
+arena reset between packets). Field-name normalization translates the
+rtshark-style identifier `tls.handshake.extension.type` to the ek-style key
+`tls_tls_handshake_extension_type` on the fly so call sites stay readable.
 
-The lookup key is **160 bits**: `(len, head, tail)` where `head` and `tail` are little-endian `u64` reads of the first and last 8 bytes of the input (or the whole content zero-padded into one `u64` if `s.len < 8`). The slot index is `(head ^ tail ^ len) & 15`. A cache hit returns the cached digest with no SHA-256 work, in constant time independent of input size.
+For TLS inside QUIC the TLS dissection lives under `quic.tls` as either an
+object (single CRYPTO frame) or an array (multiple frames in one packet); both
+`quic` itself and `quic.tls` can be arrays. `findProto("tls")` transparently
+walks every nesting permutation and prefers an element with
+`tls.handshake.type` so the right ClientHello/ServerHello is dispatched.
 
-**False-positive surface**: a wrong digest can only be returned if two inputs simultaneously collide on length, the first 8 bytes, and the last 8 bytes — 160 bits of identity. That's below the noise floor of any non-adversarial JA4 workload. For adversarial input, this is *not* a cryptographic guarantee; JA4 isn't an authenticator, so that's appropriate.
+### `hash12` is now uncached (`src/hash.zig`)
 
-The empty-input short-circuit (`s.len == 0` → `"000000000000"`) sits in front of the cache, so `len == 0` doubles as the "vacant slot" sentinel — a real input can never collide with an empty slot.
+Previous iterations memoized digests via a 16-slot direct-mapped cache keyed by
+`(len, first 8 bytes, last 8 bytes)` — 160 bits. That tripped a false-positive
+collision on `tls3.pcapng`: two distinct JA4 extension lists shared length,
+first bytes, and last bytes but had different middles, and the cache returned
+the wrong digest. Cache removed; SHA-256 (which on Apple Silicon runs on the
+`sha256h.4s` intrinsics at ~3.2 GB/s) is computed every call.
 
-### SIMD hex encoding (`encodeHex6` in `src/hash.zig`)
+### SIMD hex encoding
 
-Six raw bytes → twelve ASCII hex characters in roughly five SIMD operations on AArch64. The implementation:
+Six raw bytes → twelve ASCII hex chars in ~5 SIMD ops on AArch64. Splits
+hi/lo nibbles via `@Vector(6, u8)` shift/mask, interleaves to a 12-lane
+`@Vector(12, u8)` with `@shuffle`, then ASCII-encodes branchlessly via
+`n + '0' + ((n + 6) >> 4) * 0x27`.
 
-1. Splits each byte's hi/lo nibbles via `@Vector(6, u8)` shift+mask.
-2. Interleaves the two 6-lane vectors into a single 12-lane vector via `@shuffle` with a negative-index mask `{0, -1, 1, -2, …}` (positive picks from `hi`, `~negative` picks from `lo`).
-3. Lands each nibble in ASCII branchlessly: `n + '0' + ((n + 6) >> 4) * 0x27`. For `n in 0..=9` the shift result is 0 (lands on `'0'..'9'`); for `n in 10..=15` it's 1 (adds `0x27` to land on `'a'..'f'`).
+### Tiny ASN.1/DER walker (`src/ja4x.zig`)
 
-Replaces a per-byte table-lookup loop that the previous implementation used. On AArch64 the whole tail compiles to roughly `ushr ; and ; tbl ; add ; ushr ; mla ; str`.
+JA4X needs to extract issuer/subject RDN OIDs and extension OIDs from each
+X.509 certificate. Rather than pull in a DER dependency, we walk the cert
+structure directly: outer SEQUENCE → tbsCertificate SEQUENCE → optional
+`[0] EXPLICIT` version → serial → algorithm → issuer Name → validity → subject
+Name → SubjectPublicKey → optional `[3] EXPLICIT` extensions. Each Name is a
+SEQUENCE OF RDN, each RDN a SET OF AttributeTypeAndValue. OIDs are emitted as
+lowercase hex of the DER OID bytes (no dotted form); recognized OIDs also get
+a pretty `issuerCountryName: US` enrichment via a small lookup table that
+mirrors x509-parser's `with_x509()` default registry — including the Microsoft
+jurisdiction OIDs and intentionally **omitting** `emailAddress` because the
+Rust impl drops it.
 
 ### Parallel snapshot harness (`tests/snapshot_test.zig`)
 
-The snapshot test spawns up to `min(std.Thread.getCpuCount(), 8)` worker threads that pull pcap indices off a single `std.atomic.Value(usize)` counter. Each worker opens its own `Io.Dir` handle on the snapshots directory so they don't contend on a shared cursor.
-
-Override the worker count with `SNAPSHOT_WORKERS=N` (parsed via `std.c.getenv`) — useful for measuring serial-vs-parallel scaling. The architecture only shows its win once the real CLI invokes tshark per fixture (~50 ms of startup × 37 fixtures = ~1.85 s sequential, ~250 ms with 8 workers); against the current µs-fast stub binary, both modes finish in well under a second.
+Workers up to `min(std.Thread.getCpuCount(), 8)` pull pcap indices off an
+`std.atomic.Value(usize)` counter; each holds its own `Io.Dir` handle on the
+snapshots directory. Override the count with `SNAPSHOT_WORKERS=N`. With the
+real CLI in place (vs the µs-fast stub of phase 1), running tests now spawns
+~37 tshark processes — parallel knocks `zig build test` from several seconds
+down to under a second.
 
 ## Build, test, bench
 
 ```sh
 zig build                # produces zig-out/bin/ja4 and zig-out/bin/ja4zig-bench
-zig build test           # 14 unit tests + 37 snapshot tests (all snapshots fail vs the stub, by design)
-zig build run -- <pcap>  # run the CLI stub
+zig build test           # unit tests + snapshot harness (37 fixtures)
+zig build run -- <pcap>  # run the CLI against a pcap
 zig build bench          # full bench suite (micro + per-pcap)
 ```
 
-### Bench commands
+Bench commands:
 
 ```sh
 zig build bench                                # full suite (defaults)
 zig build bench -- micro --batches=50          # microbenchmarks only
-zig build bench -- pcap --runs=5 --warmup=2    # per-pcap only, more samples
+zig build bench -- pcap --runs=5 --warmup=2    # per-pcap only
 zig build bench -- all --json > out.json       # machine-readable output
 zig build -Dbench-optimize=Debug bench         # build the bench binary in Debug
 ```
 
-The bench binary is built in `ReleaseFast` by default. Two suites:
+Two layers:
 
-- **Microbenchmarks** — auto-calibrated iteration counts, `asm volatile` optimizer-defeat barriers. Covers `hash12` across four input sizes (empty / 20 B / 256 B / 4 KiB) and `parseVersion` (happy + miss). Reports min, median, mean, p95, stddev, CV, ops/s, and (where meaningful) MB/s.
-- **Per-pcap end-to-end** — runs every detected JA4 implementation against every fixture and reports wall-clock distribution + throughput. Detected impls: `ja4zig` (this repo), upstream `rust/ja4` release binary (if built), upstream `python/ja4.py`, and raw `tshark -T ek` as a lower-bound baseline. Missing impls are silently skipped.
+- **Microbenchmarks** — auto-calibrated iteration counts with
+  `asm volatile` memory barriers to defeat constant folding. Covers `hash12`
+  across four input sizes (empty / 20 B / 256 B / 4 KiB) and `parseVersion`
+  (happy / miss). Reports min / median / mean / p95 / stddev / CV / ops·s
+  / MB·s. `<1ns` means the body amortized below the host clock's resolution.
+- **Per-pcap end-to-end** — runs every detected JA4 implementation against
+  every fixture: `ja4zig` (this repo), `rust/ja4` release binary (if built),
+  `python/ja4.py`, and raw `tshark -T ek` as a lower bound. Missing impls are
+  silently skipped.
 
-A `<1ns` entry means the body amortized below the host clock's nanosecond resolution after `iters_per_batch` got large enough; it does not mean zero work. On the reference machine `hash12/realistic_256B` reports 1 ns / ~205 GB/s after the cache warms (effectively the cache-hit floor, not raw SHA-256 throughput), and the raw `tshark` baseline takes ~55 ms on a 1 KB pcap (dominated by tshark startup).
+Current micro numbers on Apple Silicon (`ReleaseFast`):
+
+| Bench | Time | Throughput |
+|---|---|---|
+| `hash12/short_20B` | 16 ns | 1.2 GB/s |
+| `hash12/realistic_256B` | 68 ns | 3.0 GB/s |
+| `hash12/4KiB` | 1.21 µs | 3.2 GB/s |
+| `parseVersion/happy` | 2 ns | 23.8 GB/s |
+| `parseVersion/miss` | 1 ns | — |
 
 ## Layout
 
@@ -141,52 +269,75 @@ A `<1ns` entry means the body amortized below the host clock's nanosecond resolu
 ja4zig/
 ├── build.zig
 ├── build.zig.zon
-├── config.toml               (copied from rust/ja4/config.toml)
+├── config.toml                (copied from rust/ja4/config.toml)
 ├── src/
-│   ├── main.zig              (CLI entry — currently a stub)
-│   ├── root.zig              (library root — re-exports hash, tshark)
-│   ├── hash.zig              (hash12 + content-keyed cache + SIMD hex encoder)
-│   └── tshark.zig            (parseVersion)
+│   ├── main.zig               (CLI entry — argv, run loop, YAML emit)
+│   ├── root.zig               (library root — re-exports the modules below)
+│   ├── pcap.zig               (tshark subprocess + Packet/Proto)
+│   ├── stream.zig             (Streams map + per-stream dispatch + output)
+│   ├── tcp.zig                (JA4T)
+│   ├── tls.zig                (JA4 + JA4S)
+│   ├── http.zig               (JA4H)
+│   ├── ssh.zig                (JA4SSH + ssh_extras)
+│   ├── time.zig               (JA4L-C / JA4L-S, TCP + QUIC)
+│   ├── ja4x.zig               (X.509 ASN.1/DER walker + JA4X)
+│   ├── grease.zig             (RFC 8701 GREASE detection)
+│   ├── yaml.zig               (small YAML scalar emitter w/ quoting)
+│   ├── hash.zig               (hash12 + SIMD hex encoder)
+│   └── tshark.zig             (parseVersion)
 ├── bench/
-│   ├── main.zig              (bench CLI dispatcher)
-│   ├── micro.zig             (microbenchmarks with calibration + asm barriers)
-│   ├── pcap_bench.zig        (per-pcap end-to-end across detected impls)
-│   ├── output.zig            (table + JSON formatters)
-│   ├── stats.zig             (min/median/mean/p95/stddev/CV)
-│   └── timer.zig             (std.Io.Clock wrapper)
+│   ├── main.zig               (bench CLI dispatcher)
+│   ├── micro.zig              (microbenchmarks with calibration)
+│   ├── pcap_bench.zig         (per-pcap end-to-end across detected impls)
+│   ├── output.zig             (table + JSON formatters)
+│   ├── stats.zig              (min/median/mean/p95/stddev/CV)
+│   └── timer.zig              (std.Io.Clock wrapper)
 └── tests/
-    ├── snapshot_test.zig     (parallel pcap-vs-YAML harness)
-    ├── import-snapshots.sh   (refresh YAML fixtures from upstream insta)
+    ├── snapshot_test.zig      (parallel pcap-vs-YAML harness)
+    ├── import-snapshots.sh    (refresh YAML fixtures from upstream insta)
     └── testdata/
-        ├── pcap/<name>.pcap[ng]     (vendored — 38 files, ~5.6 MB total)
-        └── snapshots/<name>.yaml    (vendored — 37 reference snapshots)
+        ├── pcap/<name>.pcap[ng]   (38 vendored — ~5.6 MB total)
+        └── snapshots/<name>.yaml  (37 vendored reference snapshots)
 ```
 
 ## Regenerating snapshot fixtures
 
-The pcap and YAML fixtures under `tests/testdata/` are vendored — the repo needs no external checkout to build or test. To refresh the YAML snapshots against a newer upstream:
+The pcap and YAML fixtures under `tests/testdata/` are vendored — the repo
+needs no external checkout to build or test. To refresh the YAML snapshots
+against a newer upstream:
 
 ```sh
 JA4_UPSTREAM=/path/to/FoxIO-LLC/ja4 ./tests/import-snapshots.sh
 ```
 
-(`JA4_UPSTREAM` defaults to `../../ja4` relative to this repo.) The `gtp-iphone.pcap` snapshot is skipped because its pcap isn't bundled upstream.
+(`JA4_UPSTREAM` defaults to `../../ja4` relative to this repo.) The
+`gtp-iphone.pcap` snapshot is skipped because its pcap isn't bundled upstream.
 
 ## Roadmap
 
-Aligned with the Rust crate's module layout. Each phase makes more snapshot fixtures pass:
+Largely cleanup work left:
 
-- **Phase 2** — tshark subprocess driver + `Packet` / `Proto` abstractions. We'll use `tshark -T ek` (NDJSON, parseable incrementally with `std.json.Scanner`) rather than PDML/XML.
-- **Phase 3** — per-protocol modules in dependency order: `tcp` → `stream` → `tls` (JA4/JA4S) → `http` (JA4H) → `ssh` (JA4SSH) → `time` (JA4L) → `ja4x` (X.509).
-- **Phase 4** — CLI flag parity with `rust/ja4`: `-j/--json`, `-o/--output`, `-r/--with-raw`, `-O/--original-order`, `--keylog-file`, `-n/--with-packet-numbers`.
+- TOML config loader (`~/.config/ja4/config.toml`) so individual fingerprint
+  types can be disabled the way the Rust CLI allows.
+- `-j/--json` output mode + `-o/--output <path>`.
+- `--keylog-file <path>` (pass to tshark, allowing decryption of captures
+  whose pre-master secrets were logged).
+- Investigate the EOF-newline serde-yaml inconsistency in upstream snapshots;
+  if a content rule emerges, restore byte-exact 37/37 match.
 
 ## License & attribution
 
-This is an independent Zig re-implementation of the upstream FoxIO JA4+ algorithms. It is not affiliated with FoxIO, LLC.
+Independent Zig re-implementation of the upstream FoxIO JA4+ algorithms. Not
+affiliated with FoxIO, LLC.
 
-The upstream licenses apply to the algorithms this port implements:
+- **JA4** (TLS client fingerprinting) is BSD 3-Clause — see
+  [upstream `LICENSE-JA4`](https://github.com/FoxIO-LLC/ja4/blob/main/LICENSE-JA4).
+  Free for commercial use.
+- **JA4+** extensions — JA4S, JA4H, JA4L, JA4X, JA4SSH (and the others) — are
+  licensed under [FoxIO License 1.1](https://github.com/FoxIO-LLC/ja4/blob/main/LICENSE),
+  which is **non-commercial only**. Any commercial use of this port's JA4+
+  output must comply with that license.
 
-- **JA4** (TLS client fingerprinting) is BSD 3-Clause — see [upstream `LICENSE-JA4`](https://github.com/FoxIO-LLC/ja4/blob/main/LICENSE-JA4). Free for commercial use.
-- **JA4+** extensions — JA4S, JA4H, JA4L, JA4X, JA4SSH (and others) — are licensed under [FoxIO License 1.1](https://github.com/FoxIO-LLC/ja4/blob/main/LICENSE), which is **non-commercial only**. If your use of this port enables the JA4+ extensions, you must comply with that license.
-
-See upstream's [License FAQ](https://github.com/FoxIO-LLC/ja4/blob/main/License%20FAQ.md) for the FoxIO License 1.1's intent and edge cases.
+See upstream's
+[License FAQ](https://github.com/FoxIO-LLC/ja4/blob/main/License%20FAQ.md) for
+the FoxIO License 1.1's intent and edge cases.
