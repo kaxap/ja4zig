@@ -3,7 +3,7 @@
 //! For every fixture in `tests/testdata/pcap/`, measures wall-clock time to
 //! produce JA4 fingerprints with each available implementation:
 //!
-//!   • ja4zig (this repo's binary) — currently a stub that exits 2.
+//!   • ja4zig (this repo's binary)
 //!   • rust   ja4 binary (cargo --release build under ../ja4/rust/target/release/ja4)
 //!   • python ja4.py (../ja4/python/ja4.py)
 //!   • tshark baseline (just `tshark -r <pcap> -T ek > /dev/null`) — gives a

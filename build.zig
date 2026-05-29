@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
     // Builds a separate `ja4zig-bench` executable that drives microbenchmarks
     // for the ported helpers plus per-pcap end-to-end timings against every
     // implementation we can find on disk (rust, python, tshark baseline,
-    // plus the ja4zig stub).
+    // plus the ja4zig binary).
     //
     // Run with: `zig build bench` (forwards extra args via `--`).
     // Default optimization for benches is ReleaseFast — it's almost always

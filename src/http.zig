@@ -166,7 +166,6 @@ fn parseCookies(s: []const u8, out: *std.ArrayList(CookiePair), gpa: std.mem.All
     while (i < s.len) {
         var end = i;
         while (end + 1 < s.len and !(s[end] == ';' and s[end + 1] == ' ')) : (end += 1) {}
-        if (end >= s.len) end = s.len else end = end;
         const slice_end = if (end + 1 < s.len) end else s.len;
         try parseOneCookie(s[i..slice_end], out, gpa);
         if (end + 1 < s.len) i = end + 2 else break;

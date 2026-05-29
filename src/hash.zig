@@ -9,17 +9,11 @@ const std = @import("std");
 ///   • Empty fast-path uses array assignment, which the compiler lowers to a
 ///     12-byte immediate store — no `@memcpy` call overhead.
 ///   • SHA-256 is at hardware throughput (ARMv8 SHA-2 intrinsics ≈ 3 GB/s
-///     on Apple Silicon, SHA-NI on recent x86_64). We can't go faster than
-///     the silicon per byte, so the only way left to "make hash12 faster"
-///     is to avoid running SHA-256 in the first place — see the cache.
-///   • Thread-local 16-slot direct-mapped cache keyed on a 160-bit content
-///     fingerprint (len + first 8 bytes + last 8 bytes). JA4 traffic is
-///     highly repetitive (same TLS client = same fingerprint string), so
-///     in practice this hits often. Cache hit cost: one u64-trio compare
-///     and a 12-byte load — independent of input size, ≈ 5 ns.
-///   • Soundness: a cache hit requires len + 64 head bits + 64 tail bits
-///     all to match. False positives require a 160-bit content collision,
-///     which is below the noise floor for non-adversarial inputs.
+///     on Apple Silicon, SHA-NI on recent x86_64), so it's computed every
+///     call. A prior version memoized digests under a (len, head8, tail8)
+///     key, but that collided on JA4 extension lists sharing length, prefix,
+///     and suffix while differing in the middle (seen on tls3.pcapng), so
+///     the cache was removed.
 ///   • The hex tail is a 12-lane SIMD branchless conversion (`@shuffle` to
 ///     interleave hi/lo nibbles, then `n + '0' + ((n+6)>>4)*0x27`).
 pub fn hash12(s: []const u8, out: *[12]u8) void {
@@ -28,12 +22,6 @@ pub fn hash12(s: []const u8, out: *[12]u8) void {
         return;
     }
 
-    // The previous version cached digests under a (len, head8, tail8) key.
-    // That key is unique enough for random-ish inputs but flunks on JA4
-    // extension lists that share the same length plus a common prefix and
-    // suffix (different middle bytes). We saw this collide on tls3.pcapng
-    // streams whose ext lists differ only in the middle. Direct SHA-256
-    // every time — at ~3 GB/s steady state, JA4 callers can't notice.
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(s, &digest, .{});
     encodeHex6(digest[0..6].*, out);
@@ -66,37 +54,7 @@ inline fn encodeHex6(b: [6]u8, out: *[12]u8) void {
     out.* = ascii;
 }
 
-// ─── Cache plumbing ──────────────────────────────────────────────────────
-
-const cache_size: usize = 16;
-
-const CacheEntry = extern struct {
-    head: u64,
-    tail: u64,
-    len: u32,
-    _pad: u32 = 0,
-    digest: [12]u8,
-};
-
-const empty_slot: CacheEntry = .{
-    .head = 0,
-    .tail = 0,
-    // len = 0 is impossible in this cache (the empty-string case short-
-    // circuits before lookup), so it serves as the "vacant" sentinel.
-    .len = 0,
-    .digest = @splat(0),
-};
-
-threadlocal var cache: [cache_size]CacheEntry = @splat(empty_slot);
-
-/// Drops every cached entry. Exists for tests that need a cold start; not
-/// part of the public API.
-pub fn resetCache() void {
-    cache = @splat(empty_slot);
-}
-
 test "hash12 known vector" {
-    resetCache();
     var buf: [12]u8 = undefined;
     hash12("551d0f,551d25,551d11", &buf);
     try std.testing.expectEqualStrings("aae71e8db6d7", &buf);
@@ -108,8 +66,7 @@ test "hash12 empty" {
     try std.testing.expectEqualStrings("000000000000", &buf);
 }
 
-test "hash12 cache returns identical bytes on repeated call" {
-    resetCache();
+test "hash12 is deterministic across repeated calls" {
     var first: [12]u8 = undefined;
     var second: [12]u8 = undefined;
     hash12("551d0f,551d25,551d11", &first);
@@ -118,21 +75,18 @@ test "hash12 cache returns identical bytes on repeated call" {
     try std.testing.expectEqualStrings("aae71e8db6d7", &second);
 }
 
-test "hash12 cache does not mix unrelated inputs" {
-    resetCache();
+test "hash12 distinguishes unrelated inputs" {
     var a: [12]u8 = undefined;
     var b: [12]u8 = undefined;
     hash12("551d0f,551d25,551d11", &a);
     hash12("different content entirely!", &b);
     try std.testing.expect(!std.mem.eql(u8, &a, &b));
-    // And the first input still resolves to the correct digest after the
-    // second call possibly evicted/displaced its slot.
+    // The first input still resolves to the correct digest afterwards.
     hash12("551d0f,551d25,551d11", &a);
     try std.testing.expectEqualStrings("aae71e8db6d7", &a);
 }
 
-test "hash12 short inputs are uniquely keyed" {
-    resetCache();
+test "hash12 short inputs differ" {
     var a: [12]u8 = undefined;
     var b: [12]u8 = undefined;
     hash12("abc", &a);

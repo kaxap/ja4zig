@@ -1,7 +1,6 @@
 //! ja4zig — Zig port of the FoxIO JA4+ Rust crate (`rust/ja4`).
 //!
-//! Modules are added incrementally. Phase 1 only exposes the helpers that the
-//! unit tests in `tests/unit/` exercise.
+//! Library root — re-exports the per-protocol modules below.
 
 pub const hash = @import("hash.zig");
 pub const tshark = @import("tshark.zig");

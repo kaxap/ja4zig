@@ -60,10 +60,9 @@ pub const Packet = struct {
     fn findNestedTls(quic_obj: *std.json.ObjectMap) ?*std.json.ObjectMap {
         const tls_val = quic_obj.getPtr("tls") orelse return null;
         switch (tls_val.*) {
-            .object => |*o| {
-                if (hasHandshake(o)) return o;
-                return o; // fall back to the first object even without handshake_type
-            },
+            // A single CRYPTO frame: use it whether or not it carries a
+            // handshake type, so we still surface SNI / cipher when present.
+            .object => |*o| return o,
             .array => |*arr| {
                 // Prefer an element that actually carries `tls.handshake.type`.
                 for (arr.items) |*el| switch (el.*) {

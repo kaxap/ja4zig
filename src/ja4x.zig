@@ -351,15 +351,13 @@ pub fn emit(
     try w.print("  tls_certs:\n", .{});
     for (state.groups.items) |grp| {
         if (with_packet_numbers) try w.print("  - pkt_x509: {d}\n    x509:\n", .{grp.pkt_num}) else try w.print("  - x509:\n", .{});
-        for (grp.records, 0..) |rec, i| {
+        for (grp.records) |rec| {
             var h_iss: [12]u8 = undefined;
             hash.hash12(rec.issuer_rdns, &h_iss);
             var h_sub: [12]u8 = undefined;
             hash.hash12(rec.subject_rdns, &h_sub);
             var h_ext: [12]u8 = undefined;
             hash.hash12(rec.extension_oids, &h_ext);
-            const prefix = if (i == 0) "    -" else "    -";
-            _ = prefix;
             try w.print("    - ja4x: {s}_{s}_{s}\n", .{ &h_iss, &h_sub, &h_ext });
             if (with_raw) {
                 try w.print("      ja4x_r: {s}_{s}_{s}\n", .{ rec.issuer_rdns, rec.subject_rdns, rec.extension_oids });

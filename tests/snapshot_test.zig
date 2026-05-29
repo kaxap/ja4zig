@@ -4,10 +4,6 @@
 //! the locally-built `ja4` binary with no flags and diffs stdout against
 //! `tests/testdata/snapshots/<basename>.yaml`.
 //!
-//! Until the implementation lands, the binary exits non-zero with a
-//! "not implemented" message — every test fails, and that's the desired
-//! starting state for phase 1.
-//!
 //! Performance: 37 subprocess spawns serially take ~2 s wall-clock even on
 //! a fast box (≈50 ms tshark startup × 37). We fan the work out to a pool
 //! of worker threads sized to the CPU count, each pulling pcap indices off
