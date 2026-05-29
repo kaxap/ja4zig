@@ -20,6 +20,10 @@ pub const Packet = struct {
     layers: *std.json.ObjectMap, // tshark's `layers` object
     num: PacketNum,
     timestamp_us: i64, // microseconds since unix epoch, from frame.time_epoch
+    /// Per-packet arena (reset between packets). Field accessors format
+    /// numeric JSON scalars into this so the returned slices stay valid for
+    /// the same lifetime as the string-valued ones (until the next packet).
+    arena: std.mem.Allocator,
 
     /// First layer with the given name. tshark's `-T ek` represents repeated
     /// layers (e.g. inner+outer IP in a GRE tunnel) as a JSON array; this
@@ -35,7 +39,7 @@ pub const Packet = struct {
                 },
                 else => return null,
             };
-            return .{ .name = name, .fields = obj, .packet_num = self.num };
+            return .{ .name = name, .fields = obj, .packet_num = self.num, .arena = self.arena };
         }
         // Fall back to nested layers — TLS rides inside `quic` CRYPTO frames.
         // tshark exposes `quic.tls` as either an object (one frame) or an
@@ -46,9 +50,9 @@ pub const Packet = struct {
         if (std.mem.eql(u8, name, "tls")) {
             const q_entry = self.layers.getPtr("quic") orelse return null;
             switch (q_entry.*) {
-                .object => |*q_obj| if (findNestedTls(q_obj)) |o| return .{ .name = name, .fields = o, .packet_num = self.num },
+                .object => |*q_obj| if (findNestedTls(q_obj)) |o| return .{ .name = name, .fields = o, .packet_num = self.num, .arena = self.arena },
                 .array => |*arr| for (arr.items) |*el| switch (el.*) {
-                    .object => |*q_obj| if (findNestedTls(q_obj)) |o| return .{ .name = name, .fields = o, .packet_num = self.num },
+                    .object => |*q_obj| if (findNestedTls(q_obj)) |o| return .{ .name = name, .fields = o, .packet_num = self.num, .arena = self.arena },
                     else => {},
                 },
                 else => {},
@@ -95,7 +99,7 @@ pub const Packet = struct {
             },
             else => return null,
         };
-        return .{ .name = name, .fields = obj, .packet_num = self.num };
+        return .{ .name = name, .fields = obj, .packet_num = self.num, .arena = self.arena };
     }
 
     pub fn hasProto(self: Packet, name: []const u8) bool {
@@ -108,6 +112,7 @@ pub const Proto = struct {
     name: []const u8,
     fields: *const std.json.ObjectMap,
     packet_num: PacketNum,
+    arena: std.mem.Allocator,
 
     /// Returns the first string-valued occurrence of `field_name`.
     /// `field_name` follows the rtshark convention (e.g. `tcp.flags`,
@@ -119,8 +124,8 @@ pub const Proto = struct {
         const v = self.fields.getPtr(key) orelse return null;
         // For array-valued fields, "first" is the first element.
         return switch (v.*) {
-            .array => |a| if (a.items.len == 0) null else scalarToStr(a.items[0]),
-            else => scalarToStr(v.*),
+            .array => |a| if (a.items.len == 0) null else scalarToStr(self.arena, a.items[0]),
+            else => scalarToStr(self.arena, v.*),
         };
     }
 
@@ -131,8 +136,8 @@ pub const Proto = struct {
         const key = ekKey(&key_buf, self.name, field_name) orelse return .empty;
         const v = self.fields.getPtr(key) orelse return .empty;
         return switch (v.*) {
-            .array => |*a| .{ .kind = .array, .arr = a, .idx = 0, .scalar = null },
-            else => .{ .kind = .scalar, .arr = null, .idx = 0, .scalar = scalarToStr(v.*) },
+            .array => |*a| .{ .kind = .array, .arr = a, .idx = 0, .scalar = null, .arena = self.arena },
+            else => .{ .kind = .scalar, .arr = null, .idx = 0, .scalar = scalarToStr(self.arena, v.*), .arena = self.arena },
         };
     }
 };
@@ -142,9 +147,12 @@ pub const ValueIter = struct {
     arr: ?*const std.json.Array,
     idx: usize,
     scalar: ?[]const u8,
+    /// Used to format numeric array elements lazily in `next`. Unused (and
+    /// `undefined`) for the `empty` iterator, which only ever yields null.
+    arena: std.mem.Allocator,
 
     pub const Kind = enum { array, scalar };
-    pub const empty: ValueIter = .{ .kind = .scalar, .arr = null, .idx = 0, .scalar = null };
+    pub const empty: ValueIter = .{ .kind = .scalar, .arr = null, .idx = 0, .scalar = null, .arena = undefined };
 
     pub fn next(self: *ValueIter) ?[]const u8 {
         switch (self.kind) {
@@ -160,7 +168,7 @@ pub const ValueIter = struct {
                 while (self.idx < a.items.len) {
                     const v = a.items[self.idx];
                     self.idx += 1;
-                    if (scalarToStr(v)) |s| return s;
+                    if (scalarToStr(self.arena, v)) |s| return s;
                 }
                 return null;
             },
@@ -184,24 +192,20 @@ fn ekKey(buf: []u8, layer: []const u8, field: []const u8) ?[]const u8 {
 }
 
 /// Coerces a tshark scalar value (string/bool/integer) to a string slice.
-/// Returns null for `null` / `object` / `array` values (the latter is the
-/// caller's job — they iterate via `values` instead).
-fn scalarToStr(v: std.json.Value) ?[]const u8 {
+/// Integers are formatted into `arena` (per-packet lifetime) so each call
+/// returns an independent slice — no shared scratch buffer to alias.
+/// Returns null for `float` / `null` / `object` / `array` values (arrays are
+/// the caller's job — they iterate via `values` instead).
+fn scalarToStr(arena: std.mem.Allocator, v: std.json.Value) ?[]const u8 {
     return switch (v) {
         .string => |s| s,
         .number_string => |s| s,
-        .integer => |i| numStr(i),
+        .integer => |i| std.fmt.allocPrint(arena, "{d}", .{i}) catch null,
         .float => null,
         .bool => |b| if (b) "true" else "false",
         .null => null,
         .object, .array => null,
     };
-}
-
-threadlocal var num_buf: [32]u8 = undefined;
-
-fn numStr(i: i64) []const u8 {
-    return std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch "0";
 }
 
 // ─── Reader: streams packets out of a tshark subprocess ──────────────────
@@ -313,7 +317,7 @@ pub const Reader = struct {
 
             const ts = extractTimestampUs(layers);
             self.next_num += 1;
-            return .{ .layers = layers, .num = self.next_num, .timestamp_us = ts };
+            return .{ .layers = layers, .num = self.next_num, .timestamp_us = ts, .arena = aa };
         }
         return null;
     }
@@ -432,4 +436,49 @@ test "parseEpochToMicros ISO" {
     try std.testing.expectEqual(@as(i64, 1703606032925092), parseEpochToMicros("2023-12-26T15:53:52.925092000Z"));
     try std.testing.expectEqual(@as(i64, 0), parseEpochToMicros("1970-01-01T00:00:00Z"));
     try std.testing.expectEqual(@as(i64, 1_000_000), parseEpochToMicros("1970-01-01T00:00:01Z"));
+}
+
+test "integer-valued fields are independent slices (no shared-buffer aliasing)" {
+    const gpa = std.testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // tcp.window_size_value is a bare integer; tcp.option_kind is an integer
+    // array. Both exercise the `.integer` path in scalarToStr.
+    const json =
+        \\{"layers":{"tcp":{"tcp_tcp_window_size_value":8192,"tcp_tcp_option_kind":[2,1,3]}}}
+    ;
+    var parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, json, .{});
+    const root = switch (parsed) {
+        .object => |*o| o,
+        else => unreachable,
+    };
+    const layers = switch (root.getPtr("layers").?.*) {
+        .object => |*o| o,
+        else => unreachable,
+    };
+    const pkt: Packet = .{ .layers = layers, .num = 1, .timestamp_us = 0, .arena = arena };
+
+    const tcp = pkt.findProto("tcp").?;
+
+    // Hold a single-value integer slice live across an iteration that yields
+    // several more integer slices. Under the old shared `num_buf` every one
+    // of these would alias the same scratch bytes and clobber `ws`.
+    const ws = tcp.first("tcp.window_size_value").?;
+    try std.testing.expectEqualStrings("8192", ws);
+
+    var it = tcp.values("tcp.option_kind");
+    var kinds: [3][]const u8 = undefined;
+    var n: usize = 0;
+    while (it.next()) |v| : (n += 1) {
+        try std.testing.expect(n < 3);
+        kinds[n] = v;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("2", kinds[0]);
+    try std.testing.expectEqualStrings("1", kinds[1]);
+    try std.testing.expectEqualStrings("3", kinds[2]);
+    // The originally-fetched value must survive the intervening conversions.
+    try std.testing.expectEqualStrings("8192", ws);
 }
